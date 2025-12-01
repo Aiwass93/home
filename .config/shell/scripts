@@ -1,3 +1,81 @@
+##################################
+# remove orphans
+##################################
+orphan() {
+  local -a pkgs
+  pkgs=($(paru -Qdtq))         # collect orphans into array
+  if (( ${#pkgs[@]} )); then
+    paru -Rns "${pkgs[@]}"     # remove them
+  else
+    echo "No orphan packages found."
+  fi
+}
+
+############################################
+# WTF (What The Fuck is that command?)
+############################################
+whatcmd() {
+  local x="$1"
+  [[ -z $x ]] && { echo "usage: whatcmd <name-or-path>"; return 2; }
+
+  # direct path given or file exists in cwd
+  if [[ $x == */* || -e $x ]]; then
+    local p="${x:A}"
+    if [[ -e $p ]]; then
+      local kind; kind=$(file -b -- "$p")
+      echo "it is a file (${kind}), located in $p"
+      return 0
+    fi
+  fi
+
+  # is it an alias?
+  if alias "$x" >/dev/null 2>&1; then
+    local a; a=$(alias "$x")
+    echo "It is an alias, located in shell: $a"
+    return 0
+  fi
+
+  # is it a function?
+  if typeset -f "$x" >/dev/null 2>&1; then
+    zmodload -F zsh/parameter 2>/dev/null || true
+    local src="${functions_source[$x]:-shell}"
+    echo "It is a shell function, located in ${src}"
+    return 0
+  fi
+
+  # is it a builtin / reserved word?
+  if whence -w "$x" >/dev/null 2>&1; then
+    local desc; desc=$(whence -w "$x")
+    case "$desc" in
+      *"shell builtin"*)
+        echo "It is a shell builtin, located in shell"; return 0 ;;
+      *"reserved word"*)
+        echo "It is a reserved word, located in shell"; return 0 ;;
+    esac
+  fi
+
+  # is it a external command?
+  if command -v -- "$x" >/dev/null 2>&1; then
+    local p; p=$(command -v -- "$x")
+    echo "It is a program, located in $p"
+    return 0
+  fi
+
+  # is it a manpage but no command?
+  if man -w "$x" >/dev/null 2>&1; then
+    local mp; mp=$(man -w "$x" | head -n1)
+    echo "it's a man page, located in $mp"
+    return 1
+  fi
+
+  echo "What is this?"
+  return 127
+}
+
+# alias
+alias wtf='whatcmd'
+
+
 ######################
 # MAN! WHAT CAN I SAY!
 # script to view manual pages in pdf, and search them in dmenu. idea was stole from luke smith's video and added some features
