@@ -15,6 +15,8 @@
 #    in your shellrc (`alias lf="lfub") or if set to a binding, should be
 #    called directly instead of normal lf.
 
+# modifications: make it able to open .cbz files directly in lf with mcomix
+
 # Basic vars
 set shellopts '-eu'
 set ifs "\n"
@@ -28,31 +30,40 @@ set autoquit true
 
 # cmds/functions
 cmd open ${{
+    # PRIORITY 1: Check by File Extension for specific formats (CBZ/CBR/EPUB/PDF)
+    case "$f" in
+        # MComix for Comics
+        *.cbz|*.cbr)
+            setsid -f mcomix "$f" >/dev/null 2>&1
+            return # Exit the function if a comic is opened
+            ;;
+        # Foliate for EPUB
+        *.epub)
+            setsid -f foliate "$f" >/dev/null 2>&1
+            return # Exit the function if an epub is opened
+            ;;
+        # Zathura for PDF
+        *.pdf)
+            setsid -f zathura "$f" >/dev/null 2>&1
+            return # Exit the function if a PDF is opened
+            ;;
+    esac
+
+    # PRIORITY 2: Check by MIME type (The rest of your original configuration)
     case $(file --mime-type "$(readlink -f $f)" -b) in
-	application/vnd.openxmlformats-officedocument.spreadsheetml.sheet) localc $fx ;;
-	image/vnd.djvu|application/pdf|application/postscript) setsid -f zathura $fx >/dev/null 2>&1 ;;
-        text/*|application/json|inode/x-empty|application/x-subrip) $EDITOR $fx;;
-	image/x-xcf) setsid -f gimp $f >/dev/null 2>&1 ;;
-	image/svg+xml) display -- $f ;;
-	image/*) rotdir $f | grep -i "\.\(png\|jpg\|jpeg\|gif\|webp\|avif\|tif\|ico\)\(_large\)*$" |
-		setsid -f nsxiv -aio 2>/dev/null | while read -r file; do
-			[ -z "$file" ] && continue
-			lf -remote "send select \"$file\""
-			lf -remote "send toggle"
-		done &
-		;;
-	audio/*|video/x-ms-asf) mpv --audio-display=no $f ;;
-	video/*) setsid -f mpv $f -quiet >/dev/null 2>&1 ;;
-	application/pdf|application/vnd.djvu|application/epub*) setsid -f zathura $fx >/dev/null 2>&1 ;;
-	application/pgp-encrypted) $EDITOR $fx ;;
-	application/vnd.openxmlformats-officedocument.wordprocessingml.document|application/vnd.oasis.opendocument.text|application/vnd.openxmlformats-officedocument.spreadsheetml.sheet|application/vnd.oasis.opendocument.spreadsheet|application/vnd.oasis.opendocument.spreadsheet-template|application/vnd.openxmlformats-officedocument.presentationml.presentation|application/vnd.oasis.opendocument.presentation-template|application/vnd.oasis.opendocument.presentation|application/vnd.ms-powerpoint|application/vnd.oasis.opendocument.graphics|application/vnd.oasis.opendocument.graphics-template|application/vnd.oasis.opendocument.formula|application/vnd.oasis.opendocument.database) setsid -f libreoffice $fx >/dev/null 2>&1 ;;
-        application/octet-stream) case ${f##*.} in
-			doc|docx|xls|xlsx|odt|ppt|pptx) setsid -f libreoffice $fx >/dev/null 2>&1 ;;
-			ghw) setsid -f gtkwave $f >/dev/null 2>&1 ;;
-			ts) setsid -f mpv $f -quiet >/dev/null 2>&1 ;;
-			*) setsid -f zathura $fx >/dev/null 2>&1 ;;
-	   	esac ;;
-	*) for f in $fx; do setsid -f $OPENER $f >/dev/null 2>&1; done;;
+    audio/*|video/x-ms-asf) mpv --audio-display=no $f ;;
+    video/*) setsid -f mpv $f -quiet >/dev/null 2>&1 ;;
+    image/vnd.djvu|application/postscript) setsid -f zathura $fx >/dev/null 2>&1 ;;
+    application/pdf|application/vnd.djvu|application/epub*) setsid -f zathura $fx >/dev/null 2>&1 ;;
+    application/pgp-encrypted) $EDITOR $fx ;;
+    application/vnd.openxmlformats-officedocument.wordprocessingml.document|application/vnd.oasis.opendocument.text|application/vnd.openxmlformats-officedocument.spreadsheetml.sheet|application/vnd.oasis.opendocument.spreadsheet|application/vnd.oasis.opendocument.spreadsheet-template|application/vnd.openxmlformats-officedocument.presentationml.presentation|application/vnd.oasis.opendocument.presentation-template|application/vnd.oasis.opendocument.presentation|application/vnd.ms-powerpoint|application/vnd.oasis.opendocument.graphics|application/vnd.oasis.opendocument.graphics-template|application/vnd.oasis.opendocument.formula|application/vnd.oasis.opendocument.database) setsid -f libreoffice $fx >/dev/null 2>&1 ;;
+    application/octet-stream) case ${f##*.} in
+        doc|docx|xls|xlsx|odt|ppt|pptx) setsid -f libreoffice $fx >/dev/null 2>&1 ;;
+        ghw) setsid -f gtkwave $f >/dev/null 2>&1 ;;
+        ts) setsid -f mpv $f -quiet >/dev/null 2>&1 ;;
+        *) setsid -f zathura $fx >/dev/null 2>&1 ;;
+        esac ;;
+    *) for f in $fx; do setsid -f $OPENER $f >/dev/null 2>&1; done;;
     esac
 }}
 
