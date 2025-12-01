@@ -13,6 +13,17 @@ if [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/x11/xprofile" ]; then
 else
 	. "$HOME/.xprofile"
 fi
+
+# make sure mpd is running
+mpd &
+
+# lock the device in 10 minits
+pkill xautolock
+xautolock -time 10 -locker slock &
+
+# unmute device
+pulsemixer --unmute &
+
 # Activate dbus variables
 dbus-update-activation-environment --all
 dbus-launch ssh-agent dwm
