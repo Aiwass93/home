@@ -1,0 +1,56 @@
+#!/bin/bash
+
+# this is a script to rank mirrors
+# it's for artix linux with arch repo only, use it on other os need modification
+# for safety, i separate the mirrorlist to two files, mirrorlist and mirrorlist-ranked
+# the script will rank the original mirrorlist and put the result to mirrorlist-ranked, so if it failed it won't affect the original mirrorlist.
+# so, you should also edit your /etc/pacman.d
+
+# ask for password so i don't need to enter it later
+sudo -v || exit 1
+
+# keep sudo alive in the background while script runs
+#!/bin/bash
+
+# ask password immediately.
+# if the you cancels or failed password it exit
+if ! sudo -v; then
+    echo "Bye bye have a great day"
+    exit 1
+fi
+
+# keep sudo alive in the background so it don't timeout during ranking
+while true; do sudo -n true; sleep 60; kill -0 "$$" || exit; done 2>/dev/null &
+
+# rank
+rank() {
+    printf "Ranking %s... " "$1"
+
+    tmp=$(mktemp)
+
+    # run silently
+    if rate-mirrors --protocol https "$1" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+        sudo mv "$tmp" "$2"
+        sudo chmod 644 "$2"
+        echo "Done."
+        return 0
+    else
+        echo "I refuse"
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+# execution
+
+# track errors
+error=0
+
+rank "artix" "/etc/pacman.d/mirrorlist-ranked" || error=1
+rank "arch"  "/etc/pacman.d/mirrorlist-arch-ranked" || error=1
+
+if [ $error -eq 0 ]; then
+    echo "Everything is Ok."
+else
+    echo "Sorry, I prefer the old ones."
+fi
