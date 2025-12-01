@@ -67,7 +67,13 @@ bindkey -s '^o' '^ulfcd\n'
 
 bindkey -s '^a' '^ubc -lq\n'
 
-bindkey -s '^f' '^ucd "$(dirname "$(fzf)")"\n'
+# bindkey -s '^f' '^ucd "$(dirname "$(fzf)")"\n'
+
+# ctrl f to search file names
+bindkey -s '^f' '^uff\n'
+
+# ctrl g to search content
+bindkey -s '^g' '^ufg\n'
 
 bindkey '^[[P' delete-char
 
