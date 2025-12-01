@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+import curses
+from curses.textpad import rectangle
+import subprocess
+import socket
+import json
+import time
+import os
+import sys
+import shutil
+
+# this is a script for playing youtube live radios (for example, lofigirl) on terminla emulator.
+# you can also use this command:
+# mpv --no-video --ytdl-format="best" "https://youtubelivelink"
+# but i won't because it's ugly
+
+# configs
+if os.path.exists("/tmp"):
+    IPC_SOCKET = f"/tmp/radio_fast_{os.getpid()}.sock"
+else:
+    IPC_SOCKET = f"radio_fast_{os.getpid()}.sock"
+
+class RadioClient:
+    def __init__(self):
+        self.sock = None
+        self.buffer = ""
+        self.req_id = 0
+        self.connected = False
+
+    def connect(self):
+        if not os.path.exists(IPC_SOCKET):
+            return False
+        try:
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.connect(IPC_SOCKET)
+            self.sock.settimeout(0.01) # short timeout for speed
+            self.connected = True
+            return True
+        except (ConnectionRefusedError, FileNotFoundError, OSError):
+            self.connected = False
+            return False
+
+    def send(self, command_list):
+        if not self.sock: return
+        try:
+            self.req_id += 1
+            msg = {"command": command_list, "request_id": self.req_id}
+            data = json.dumps(msg) + "\n"
+            self.sock.sendall(data.encode())
+        except (BrokenPipeError, OSError):
+            self.connected = False
+            self.sock = None
+
+    def read_messages(self):
+        if not self.sock: return []
+        messages = []
+        try:
+            while True:
+                # read larger chunks to clear buffer faster
+                chunk = self.sock.recv(16384).decode('utf-8', errors='ignore')
+                if not chunk: break
+                self.buffer += chunk
+        except socket.timeout:
+            pass
+        except OSError:
+            self.connected = False
+            self.sock = None
+            return []
+
+        while "\n" in self.buffer:
+            line, self.buffer = self.buffer.split("\n", 1)
+            if line.strip():
+                try:
+                    messages.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+        return messages
+
+def clean_title(title):
+    """Removes the date suffix like '... to 2025-11-21'."""
+    if not title: return ""
+    if " to 20" in title:
+        return title.split(" to 20")[0].strip()
+    return title
+
+def draw_ui(stdscr, state):
+    h, w = stdscr.getmaxyx()
+    bw, bh = min(80, w-2), 10
+    bx, by = (w - bw)//2, (h - bh)//2
+
+    stdscr.erase()
+
+    # border
+    if state['connected']:
+        c_border = curses.color_pair(2) # green
+    else:
+        c_border = curses.color_pair(3) # yellow
+
+    stdscr.attron(c_border)
+    rectangle(stdscr, by, bx, by+bh-1, bx+bw-1)
+    stdscr.attroff(c_border)
+
+    def center(y, txt, attr=0):
+        max_len = bw - 4
+        if len(txt) > max_len: txt = txt[:max_len]
+        stdscr.addstr(by + y, bx + (bw - len(txt))//2, txt, attr)
+
+    # header
+    center(0, " TERMINAL RADIO ", curses.A_BOLD | c_border)
+
+    # title
+    if not state['connected']:
+        center(3, "STARTING MPV...", curses.color_pair(3) | curses.A_BLINK)
+    elif state['title'] == "Loading...":
+        center(3, "BUFFERING...", curses.color_pair(3))
+    else:
+        center(3, state['title'], curses.A_BOLD)
+
+    # host
+    center(4, state['artist'], curses.A_DIM)
+
+    # playbar
+    bar_w = bw - 10
+    if state['paused'] or not state['connected']:
+        bar = "." * bar_w
+    else:
+        t = int(time.time() * 12)
+        pos = t % bar_w
+        if (t // bar_w) % 2 == 1: pos = bar_w - 1 - pos
+        chars = [" "] * bar_w
+        chars[pos] = "█"
+        if 0 <= pos-1 < bar_w: chars[pos-1] = "▒"
+        if 0 <= pos+1 < bar_w: chars[pos+1] = "▒"
+        bar = "".join(chars)
+
+    center(6, f"[{bar}]", curses.color_pair(4))
+
+    stdscr.refresh()
+
+def main(stdscr):
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, -1, -1)
+    curses.init_pair(2, curses.COLOR_GREEN, -1)
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)
+    curses.init_pair(4, curses.COLOR_CYAN, -1)
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+
+    if not shutil.which("mpv"):
+        stdscr.addstr(0,0, "Error: 'mpv' is not installed.")
+        stdscr.refresh()
+        time.sleep(3)
+        return
+
+    url = sys.argv[1] if len(sys.argv) > 1 else "https://www.youtube.com/watch?v=jfKfPfyJRdk"
+
+    if os.path.exists(IPC_SOCKET):
+        try: os.unlink(IPC_SOCKET)
+        except: pass
+
+    # speed up launch by --no-config
+    cmd = [
+        "mpv", "--no-video", "--no-config",
+        "--ytdl-format=bestaudio/best",
+        f"--input-ipc-server={IPC_SOCKET}",
+        "--idle=yes",
+        "--force-window=no",
+        "--quiet",
+        url
+    ]
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    client = RadioClient()
+
+    state = {
+        "connected": False,
+        "title": "Loading...",
+        "artist": "",
+        "paused": False
+    }
+
+    last_check = 0
+
+    try:
+        while True:
+            if proc.poll() is not None:
+                state['title'] = "STREAM ENDED"
+                state['connected'] = False
+                draw_ui(stdscr, state)
+                time.sleep(2)
+                break
+
+            # connect logic
+            if not client.connected:
+                if client.connect():
+                    # immediately request data and observe
+                    cmds = ["media-title", "metadata", "pause"]
+                    for p in cmds:
+                        client.send(["observe_property", 1, p])
+                        client.send(["get_property", p]) # Force immediate fetch
+
+            # read messages
+            msgs = client.read_messages()
+            for m in msgs:
+                name = m.get("name")
+                data = m.get("data")
+
+                # some responses come as "data" directly if requested via get_property, others come as events, we handle both
+
+                # if it's a response to get_property, match blindly or by assumption
+                if data is None and m.get("error") == "success":
+                    continue
+
+                # if we received an event or a direct data response
+                # note that observe_property events usually have "name", and get_property responses have "data" but no "name" in strict JSON-IPC, but observe events are easier to track.
+
+                if name == "media-title" and data:
+                    state['title'] = clean_title(str(data))
+                elif name == "pause":
+                    state['paused'] = (data is True)
+                elif name == "metadata" and isinstance(data, dict):
+                    state['artist'] = data.get("uploader", data.get("artist", ""))
+
+            # do not always loading pls
+            if time.time() - last_check > 0.5:
+                if client.connected and state['title'] == "Loading...":
+                    client.send(["get_property", "media-title"])
+                    client.send(["get_property", "metadata"])
+                last_check = time.time()
+
+            # update ui
+            state['connected'] = client.connected
+            draw_ui(stdscr, state)
+
+            key = stdscr.getch()
+            if key in [ord('q'), ord('Q')]: break
+            if client.connected:
+                if key in [ord('p'), ord('P')]:
+                    client.send(["cycle", "pause"])
+
+            # fast loop for smooth ui
+            time.sleep(0.02)
+
+    finally:
+        proc.terminate()
+        if os.path.exists(IPC_SOCKET):
+            try: os.unlink(IPC_SOCKET)
+            except: pass
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        pass
