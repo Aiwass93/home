@@ -1,0 +1,10 @@
+#!/bin/sh
+
+# let nsxiv play images in a folder in natural order
+
+# handle the case where the user passes a path with ~ in quotes or special chars
+# use real path if available or rely on the shell passing the expanded path
+DIR="${1:-.}"
+
+# find files, sort naturally, play it in nsxiv
+find "$DIR" -maxdepth 1 -type f | sort -V | nsxiv -i
