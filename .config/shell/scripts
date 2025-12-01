@@ -1,0 +1,16 @@
+######################
+# MAN! WHAT CAN I SAY!
+# script to view manual pages in pdf, and search them in dmenu. idea was stole from luke smith's video and added some features
+######################
+man() {
+    if [ $# -eq 0 ]; then
+        # search in dmenu if only type "man"
+        local page=$(command man -k . | dmenu -l 30 | awk '{print $1}')
+        [ -n "$page" ] && command man -Tpdf "$page" 2>/dev/null | zathura - 2>/dev/null
+    else
+        # man + xxx to directly open pdf manual
+        if command man -w "$@" >/dev/null 2>&1; then
+            command man -Tpdf "$@" 2>/dev/null | zathura - 2>/dev/null
+        fi
+    fi
+}
