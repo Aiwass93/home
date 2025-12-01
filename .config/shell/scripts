@@ -14,3 +14,125 @@ man() {
         fi
     fi
 }
+
+######################
+# FZF TOOL
+# make fuzzy find program actually work, able to preview images and text files, auto skip huge files for safety, auto skip binary files to avoid meaningless content
+######################
+
+# capture path for recursive calls
+SELF=${(%):-%x}
+
+# helper functions
+
+_fzf_opener() {
+    local file="${1%%:*}"
+    local line="${1##*:}"
+    if [[ ! -e "$file" ]]; then return; fi
+    case "$file" in
+        *.png|*.jpg|*.jpeg|*.gif|*.webp) setsid -f nsxiv "$file" >/dev/null 2>&1 ;;
+        *.mp4|*.mkv|*.webm)             setsid -f mpv "$file" >/dev/null 2>&1 ;;
+        *.pdf)                          setsid -f zathura "$file" >/dev/null 2>&1 ;;
+        *)
+            if [[ "$line" =~ ^[0-9]+$ ]] && [ "$line" != "$file" ]; then
+                nvim "+$line" "$file"
+            else
+                nvim "$file"
+            fi
+            ;;
+    esac
+}
+
+_fzf_previewer() {
+    local file="${1%%:*}"
+    local line="${1##*:}"
+
+    # check files
+    if [ -d "$file" ]; then
+        ls -A --color=always "$file"
+        return
+    fi
+    # check file size, skip it if too large (default 10mb)
+    if [ -f "$file" ] && [ "$(wc -c < "$file")" -gt 10000000 ]; then
+        echo -e "\033[31m[!] File too large for preview (>10MB)\033[0m"
+        return
+    fi
+    # check binary files
+    if grep -qI . "$file" 2>/dev/null; then
+        :
+    else
+        if [[ ! "$file" =~ \.(png|jpg|jpeg|gif|webp|mp4|mkv|webm|pdf)$ ]]; then
+             echo -e "\033[33m[!] Binary file detected - Preview skipped\033[0m"
+             return
+        fi
+    fi
+    #########################################
+
+    if [[ "$file" =~ \.(png|jpg|jpeg|gif|webp)$ ]]; then
+        chafa -c full --color-space rgb -s "${FZF_PREVIEW_COLUMNS}x${FZF_PREVIEW_LINES}" "$file"
+    elif [[ "$file" =~ \.(mp4|mkv|webm)$ ]]; then
+        local thumb="/tmp/fzf-thumb.jpg"
+        ffmpegthumbnailer -i "$file" -o "$thumb" -s 0 -q 5 >/dev/null 2>&1
+        chafa -c full --color-space rgb -s "${FZF_PREVIEW_COLUMNS}x${FZF_PREVIEW_LINES}" "$thumb"
+    else
+        if [[ "$line" =~ ^[0-9]+$ ]] && [ "$line" != "$file" ]; then
+            bat --style=numbers --color=always --highlight-line "$line" "$file"
+        else
+            bat --style=numbers --color=always "$file"
+        fi
+    fi
+}
+
+# diapatcher
+if [[ "$1" == "--preview" ]]; then
+    _fzf_previewer "$2"
+    return 0
+fi
+if [[ "$1" == "--open" ]]; then
+    _fzf_opener "$2"
+    return 0
+fi
+
+# main commands
+
+# we use functions with underscores so we can alias them safely
+
+_ff_func() {
+    # takes all arguments as the query (you should quote "multi word strings like this")
+    local query="$*"
+
+    IFS=$'\n' files=($(fd --type f --hidden --follow --exclude .git | \
+        fzf --query "$query" \
+            --preview "zsh $SELF --preview {}" \
+            --layout=reverse \
+            --border \
+            --height 100% \
+            --preview-window='right:62%,border-left' \
+            --bind 'enter:become(echo {})'
+    ))
+    [[ -n "$files" ]] && _fzf_opener "$files"
+}
+
+_fg_func() {
+    # take all arguments as the query
+    local query="$*"
+
+    rm -f /tmp/rg-fzf-{r,f}
+    # we escape quotes to prevent breaking the fzf bind string
+    RG_PREFIX="rg --column --line-number --no-heading --color=always --smart-case "
+
+    fzf --ansi --disabled --query "$query" \
+        --bind "start:reload:$RG_PREFIX {q}" \
+        --bind "change:reload:$RG_PREFIX {q}" \
+        --delimiter : \
+        --preview "zsh $SELF --preview {1}:{2}" \
+        --layout=reverse \
+        --border \
+        --height 100% \
+        --preview-window 'right:62%,border-left' \
+        --bind "enter:execute(zsh $SELF --open {1}:{2})+abort"
+}
+
+# aliases
+alias ff='noglob _ff_func'
+alias fg='noglob _fg_func'
