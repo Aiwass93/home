@@ -1,0 +1,6 @@
+/* database of quotes you like */
+/* use $(strfile database-name) to make it into a .dat file, which fortune-mod can read */
+/* in the format like this: */
+/* quote1 */
+/* % (this is to split different quotes) */
+/* quote2 */
