@@ -1,5 +1,7 @@
 # Luke's config for the Zoomer Shell
 
+# edit: added the scripts file to load
+
 # Enable colors and change prompt:
 autoload -U colors && colors	# Load colors
 PS1="%B%{$fg[red]%}[%{$fg[yellow]%}%n%{$fg[green]%}@%{$fg[blue]%}%M %{$fg[magenta]%}%~%{$fg[red]%}]%{$reset_color%}$%b "
@@ -18,6 +20,7 @@ setopt inc_append_history
 [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/shell/shortcutenvrc" ] && source "${XDG_CONFIG_HOME:-$HOME/.config}/shell/shortcutenvrc"
 [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/shell/aliasrc" ] && source "${XDG_CONFIG_HOME:-$HOME/.config}/shell/aliasrc"
 [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/shell/zshnameddirrc" ] && source "${XDG_CONFIG_HOME:-$HOME/.config}/shell/zshnameddirrc"
+[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/shell/scripts" ] && source "${XDG_CONFIG_HOME:-$HOME/.config}/shell/scripts"
 
 # Basic auto/tab complete:
 autoload -U compinit
