@@ -6,51 +6,73 @@
 # the script will rank the original mirrorlist and put the result to mirrorlist-ranked, so if it failed it won't affect the original mirrorlist.
 # so, you should also edit your /etc/pacman.d
 
-# ask for password so i don't need to enter it later
-sudo -v || exit 1
-
-# keep sudo alive in the background while script runs
-#!/bin/bash
-
-# ask password immediately.
-# if the you cancels or failed password it exit
+# 1. ask for password
 if ! sudo -v; then
-    echo "Bye bye have a great day"
+    echo "Aborted."
     exit 1
 fi
 
-# keep sudo alive in the background so it don't timeout during ranking
+# keep sudo alive in the background
 while true; do sudo -n true; sleep 60; kill -0 "$$" || exit; done 2>/dev/null &
 
-# rank
-rank() {
-    printf "Ranking %s... " "$1"
+# function: rank_repo(type, source_file, dest_file)
+rank_repo() {
+    REPO_TYPE="$1"
+    SOURCE_FILE="$2"
+    DEST_FILE="$3"
+    TMP_FILE=$(mktemp)
 
-    tmp=$(mktemp)
+    printf "Ranking %s... " "$REPO_TYPE"
 
-    # run silently
-    if rate-mirrors --protocol https "$1" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
-        sudo mv "$tmp" "$2"
-        sudo chmod 644 "$2"
+    if [ "$REPO_TYPE" = "artix" ]; then
+        # --- ARTIX LOGIC ---
+        # 1. Extract raw URLs (remove Server =)
+        # 2. Rank via stdin
+        # 3. CRITICAL FIX: Only add 'Server = ' to lines starting with http/ftp.
+        #    This ignores comments (#) and blank lines.
+        sed -n 's/^Server = //p' "$SOURCE_FILE" | \
+        rate-mirrors --protocol https stdin | \
+        sed -n 's/^\(http.*\)/Server = \1/p' > "$TMP_FILE" 2>/dev/null
+
+    elif [ "$REPO_TYPE" = "arch" ]; then
+        # --- ARCH LOGIC ---
+        # rate-mirrors handles Arch natively.
+        rate-mirrors --protocol https arch > "$TMP_FILE" 2>/dev/null
+    fi
+
+    # Check if the file has content
+    if [ -s "$TMP_FILE" ]; then
+        # Move the file
+        sudo mv "$TMP_FILE" "$DEST_FILE"
+        # FIX PERMISSIONS: Ensure root owns the file
+        sudo chown root:root "$DEST_FILE"
+        sudo chmod 644 "$DEST_FILE"
         echo "Done."
         return 0
     else
-        echo "I refuse"
-        rm -f "$tmp"
+        echo "Failed! (Zero mirrors found or tool error)"
+        rm -f "$TMP_FILE"
         return 1
     fi
 }
 
-# execution
-
-# track errors
+# execute
 error=0
 
-rank "artix" "/etc/pacman.d/mirrorlist-ranked" || error=1
-rank "arch"  "/etc/pacman.d/mirrorlist-arch-ranked" || error=1
-
-if [ $error -eq 0 ]; then
-    echo "Everything is Ok."
+# 1. Rank Artix Mirrors
+if [ -f "/etc/pacman.d/mirrorlist" ]; then
+    rank_repo "artix" "/etc/pacman.d/mirrorlist" "/etc/pacman.d/mirrorlist-ranked" || error=1
 else
-    echo "Sorry, I prefer the old ones."
+    echo "Error: /etc/pacman.d/mirrorlist not found."
+    error=1
+fi
+
+# 2. Rank Arch Mirrors
+rank_repo "arch" "none" "/etc/pacman.d/mirrorlist-arch-ranked" || error=1
+
+# Final Status
+if [ $error -eq 0 ]; then
+    echo "Success: All mirrorlists updated."
+else
+    echo "Warning: One or more mirrorlists failed to update."
 fi
