@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+
+# the script to bulk convert audio files to opus, it's a format which can have decent quality while been super small, i convert my songs on computer to flac to listen them on my phone.
+
+import os
+import subprocess
+import sys
+import base64
+from pathlib import Path
+
+# Try import mutagen for artwork handling
+try:
+    import mutagen
+    from mutagen import File
+    from mutagen.flac import Picture
+except ImportError:
+    print("WARNING: 'mutagen' library not found. Artwork will NOT be copied.")
+    print("Run: pip install mutagen")
+    mutagen = None
+
+###### config
+SOURCE_DIR = r"/this is the path to the folder which contains all music you wanna convert"
+DEST_DIR   = r"/this is the path to the destination of the converted opus files."
+
+EXT_LOSSLESS = {'.flac', '.wav', '.aiff', '.ape', '.alac'}
+EXT_LOSSY    = {'.mp3', '.m4a', '.aac', '.ogg', '.wma'}
+
+def get_bitrate(extension):
+    ext = extension.lower()
+    if ext in EXT_LOSSLESS:
+        return "96k"
+    if ext in EXT_LOSSY:
+        return "192k"
+    return None
+
+def copy_artwork(source_path, dest_path):
+    """
+    Reads artwork from source and embeds it into the Opus file
+    using standard VorbisComment METADATA_BLOCK_PICTURE.
+    """
+    if not mutagen:
+        return
+
+    try:
+        source_file = File(source_path)
+        dest_file = File(dest_path)
+
+        pics = []
+
+        # extract from flac/vorbis
+        if hasattr(source_file, 'pictures'):
+            pics = source_file.pictures
+
+        # extract from id3(mp3)
+        elif hasattr(source_file, 'tags'):
+            for key in source_file.tags.keys():
+                if key.startswith('APIC:'):
+                    # Convert APIC frame to Flac Picture format
+                    apic = source_file.tags[key]
+                    p = Picture()
+                    p.data = apic.data
+                    p.type = apic.type
+                    p.mime = apic.mime
+                    p.desc = apic.desc
+                    pics.append(p)
+
+        if not pics:
+            return
+
+        # embed into opus
+        # opus requires the picture block to be base64 encoded inside a comment
+        dest_file['metadata_block_picture'] = [
+            base64.b64encode(p.write()).decode('ascii') for p in pics
+        ]
+        dest_file.save()
+
+    except Exception as e:
+        print(f"    [Warning] cannot copy art: {e}")
+
+def convert_library():
+    if not os.path.exists(SOURCE_DIR):
+        print(f"Error: source directory not found: {SOURCE_DIR}")
+        return
+
+    print(f"Scanning: {SOURCE_DIR}")
+    print(f"Target:   {DEST_DIR}")
+    print("-" * 40)
+
+    for root, dirs, files in os.walk(SOURCE_DIR):
+        for filename in files:
+            source_path = Path(root) / filename
+            target_bitrate = get_bitrate(source_path.suffix)
+            if not target_bitrate:
+                continue
+
+            relative_path = source_path.relative_to(SOURCE_DIR)
+            dest_path = Path(DEST_DIR) / relative_path.with_suffix('.opus')
+
+            os.makedirs(dest_path.parent, exist_ok=True)
+
+            if dest_path.exists():
+                # print(f"[SKIP] Exists: {relative_path}")
+                continue
+
+            print(f"[CONVERTING] ({target_bitrate}): {relative_path}")
+
+            # ffmpeg commands
+            cmd = [
+                'ffmpeg',
+                '-n',                  # do not overwrite
+                '-nostdin',            # no terminal interaction
+                '-loglevel', 'error',  # quiet output
+                '-err_detect', 'ignore_err', # ignore corrupted headers
+                '-i', str(source_path),
+                '-map', '0:a',         # select only audio
+                '-vn',                 # explicitly disable video streams
+                '-map_metadata', '0',  # copy text tags (Artist, Title, etc)
+                '-c:a', 'libopus',
+                '-b:a', target_bitrate,
+                '-vbr', 'on',
+                str(dest_path)
+            ]
+
+            try:
+                subprocess.run(cmd, check=True)
+                # copy the artwork manually
+                copy_artwork(source_path, dest_path)
+
+            except subprocess.CalledProcessError:
+                print(f"!! ERROR converting: {filename}")
+            except KeyboardInterrupt:
+                print("\nStopping script...")
+                sys.exit()
+
+    print("-" * 40)
+    print("Done!")
+
+if __name__ == "__main__":
+    convert_library()
