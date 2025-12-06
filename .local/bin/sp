@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+
+# script to split the audio file by the cuesheet, use it to split downloaded album which only have one single audio file and depends on cuesheet to different tracks.
+# normally modern players are able to handle cuesheet, but it does cause errors sometimes which is annoying.
+
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+######## config
+# define lossless extensions, safe to re-encode to fix headers
+LOSSLESS_EXTS = {'.flac', '.wav', '.alac', '.ape', '.wma', '.tak'}
+
+def get_seconds(timestamp):
+    """Converts MM:SS:FF (frames) to seconds."""
+    parts = timestamp.split(':')
+    minutes = int(parts[0])
+    seconds = int(parts[1])
+    frames = int(parts[2])
+    return (minutes * 60) + seconds + (frames / 75.0)
+
+def sanitize_filename(name):
+    """Removes illegal characters from filenames."""
+    return re.sub(r'[<>:"/\\|?*]', '_', str(name)).strip()
+
+def find_audio_file(cue_dir, filename_from_cue):
+    """
+    Finds the audio file, handling case sensitivity and different extensions.
+    """
+    cue_dir = Path(cue_dir)
+    target = cue_dir / filename_from_cue
+
+    if target.exists():
+        return target
+
+    # try finding same name with common audio extensions
+    stem = Path(filename_from_cue).stem
+    # prioritize .ape and .flac for this specific use case
+    extensions = ['.ape', '.flac', '.wav', '.mp3', '.m4a', '.alac', '.tak']
+
+    for ext in extensions:
+        candidate = cue_dir / f"{stem}{ext}"
+        if candidate.exists():
+            return candidate
+
+    # as a fallback, look for any audio file in the folder if only one exists
+    # (optional robustness, sometimes cuesheet filenames are just totally wrong
+    return None
+
+def parse_cue(cue_path):
+    """
+    Parses CUE sheet for tracks and global metadata.
+    """
+    encodings = ['utf-8', 'latin-1', 'cp1252', 'shift_jis']
+    content = []
+
+    for enc in encodings:
+        try:
+            with open(cue_path, 'r', encoding=enc) as f:
+                content = f.readlines()
+            break
+        except UnicodeDecodeError:
+            continue
+
+    if not content:
+        print(f"Error: cannot not read {cue_path} (encoding issue).")
+        return []
+
+    tracks = []
+    current_track = {}
+
+    # defaults
+    album_meta = {
+        'artist': 'Unknown Artist',
+        'title': 'Unknown Album',
+        'date': None,
+        'genre': None,
+        'disc': None
+    }
+
+    current_file = None
+
+    for line in content:
+        line = line.strip()
+
+        # global metadata (rem tags)
+        if line.startswith('REM DATE'):
+            album_meta['date'] = line.split(' ', 2)[2]
+        elif line.startswith('REM GENRE'):
+            album_meta['genre'] = line.split(' ', 2)[2]
+        elif line.startswith('REM DISCID') or line.startswith('REM DISC'):
+            match = re.search(r'\d+', line)
+            if match: album_meta['disc'] = match.group(0)
+
+        # file tracking
+        if line.startswith('FILE'):
+            match = re.search(r'FILE "(.*)"', line)
+            if match: current_file = match.group(1)
+
+        # global artist/title (before first track)
+        if not tracks and not current_track.get('number'):
+            if line.startswith('PERFORMER'):
+                match = re.search(r'PERFORMER "(.*)"', line)
+                if match: album_meta['artist'] = match.group(1)
+            if line.startswith('TITLE'):
+                match = re.search(r'TITLE "(.*)"', line)
+                if match: album_meta['title'] = match.group(1)
+
+        # track logic
+        if line.startswith('TRACK'):
+            if current_track:
+                tracks.append(current_track)
+
+            num_match = re.search(r'TRACK (\d+)', line)
+            track_num = num_match.group(1) if num_match else "00"
+
+            current_track = {
+                'file': current_file,
+                'number': track_num,
+                'artist': album_meta['artist'],
+                'album': album_meta['title'],
+                'date': album_meta['date'],
+                'genre': album_meta['genre'],
+                'disc': album_meta['disc']
+            }
+
+        if line.startswith('TITLE') and current_track:
+            match = re.search(r'TITLE "(.*)"', line)
+            if match: current_track['title'] = match.group(1)
+
+        if line.startswith('PERFORMER') and current_track:
+            match = re.search(r'PERFORMER "(.*)"', line)
+            if match: current_track['artist'] = match.group(1)
+
+        if line.startswith('INDEX 01') and current_track:
+            match = re.search(r'INDEX 01 (\d{2}:\d{2}:\d{2})', line)
+            if match:
+                current_track['start_time'] = get_seconds(match.group(1))
+
+    if current_track:
+        tracks.append(current_track)
+
+    return tracks
+
+def split_audio():
+    base_dir = Path.cwd()
+    cue_files = list(base_dir.glob("*.cue"))
+
+    if not cue_files:
+        print("No .cue files, are you sure you're using the correct path?")
+        return
+
+    print(f"Found {len(cue_files)} cuesheet(s), nice")
+
+    for cue_file in cue_files:
+        print(f"\nProcessing CUE: {cue_file.name}")
+        tracks = parse_cue(cue_file)
+
+        if not tracks:
+            print("  Skipping: no tracks found")
+            continue
+
+        # use the same folder as the cuesheet
+        out_dir = cue_file.parent
+
+        total_tracks = len(tracks)
+
+        for i, track in enumerate(tracks):
+            audio_source = find_audio_file(base_dir, track['file'])
+
+            if not audio_source:
+                print(f"  Error: audio file '{track['file']}' not found")
+                continue
+
+            # ape & format logic
+            input_ext = audio_source.suffix.lower()
+
+            # def settings
+            out_ext = input_ext
+            audio_codec = 'copy' # Default to stream copy (fastest, lossless)
+
+            # special handling for ape ot flac because flac has better support
+            if input_ext == '.ape':
+                out_ext = '.flac'
+                audio_codec = 'flac'
+            # handling for existing flac/wav (re-encode to fix headers/seekpoints
+            elif input_ext in ['.flac', '.wav', '.tak']:
+                out_ext = input_ext
+                audio_codec = 'flac' if input_ext == '.flac' else 'pcm_s16le'
+
+            # prepare filename
+            track_num = track.get('number', f"{i+1:02d}")
+            title = track.get('title', f"Track {track_num}")
+            safe_title = sanitize_filename(title)
+
+            out_name = f"{track_num} - {safe_title}{out_ext}"
+            out_path = out_dir / out_name
+
+            # time calculation
+            start_time = track['start_time']
+            duration = None
+            if i < total_tracks - 1:
+                if tracks[i+1]['file'] == track['file']:
+                    duration = tracks[i+1]['start_time'] - start_time
+
+            # ffmpeg commands
+            cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error']
+
+            # input
+            cmd.extend(['-ss', f"{start_time:.6f}"])
+            cmd.extend(['-i', str(audio_source)])
+
+            # duration
+            if duration:
+                cmd.extend(['-t', f"{duration:.6f}"])
+
+            # Map streams (Audio + Video/CoverArt)
+            cmd.extend(['-map', '0:a', '-map_metadata', '-1'])
+            cmd.extend(['-map', '0:v?'])
+            cmd.extend(['-c:v', 'copy']) # Keep cover art
+
+            # apply audio codec detect above
+            cmd.extend(['-c:a', audio_codec])
+
+            # if converting to flac, set compression make it not lose quality
+            if audio_codec == 'flac':
+                cmd.extend(['-compression_level', '8'])
+
+            # tags
+            cmd.extend(['-metadata', f'title={title}'])
+            cmd.extend(['-metadata', f'artist={track["artist"]}'])
+            cmd.extend(['-metadata', f'album={track["album"]}'])
+            cmd.extend(['-metadata', f'track={track_num}/{total_tracks}'])
+
+            if track.get('date'):
+                cmd.extend(['-metadata', f'date={track["date"]}'])
+            if track.get('genre'):
+                cmd.extend(['-metadata', f'genre={track["genre"]}'])
+            if track.get('disc'):
+                cmd.extend(['-metadata', f'disc={track["disc"]}'])
+
+            cmd.append(str(out_path))
+
+            print(f"  [{track_num}/{total_tracks}] {title} -> {out_ext}")
+
+            try:
+                subprocess.run(cmd, check=True)
+            except subprocess.CalledProcessError:
+                print("  ERROR: ffmpeg failed! make sure FFmpeg is installed")
+                break
+
+    print("\nComplete!")
+
+if __name__ == "__main__":
+    split_audio()
