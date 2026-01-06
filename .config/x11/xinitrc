@@ -9,19 +9,21 @@
 # I source them here with the line below.
 
 if [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/x11/xprofile" ]; then
-	. "${XDG_CONFIG_HOME:-$HOME/.config}/x11/xprofile"
+        . "${XDG_CONFIG_HOME:-$HOME/.config}/x11/xprofile"
 else
-	. "$HOME/.xprofile"
+        . "$HOME/.xprofile"
 fi
 
-# make sure mpd is running
-mpd &
-
-# lock the device in 10 minits
+# autolock 10 min
 pkill xautolock
 xautolock -time 10 -locker slock &
 
-# unmute device
+/usr/bin/pulseaudio --start &
+
+# Start MPD only if it's not already running
+pidof -sx "mpd" || mpd &
+
+# Now that the daemon is running, you can unmute the main volume.
 pulsemixer --unmute &
 
 # Activate dbus variables
