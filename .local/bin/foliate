@@ -1,9 +1,11 @@
 #!/bin/sh
-
+# Force CPU rendering (Prevent Crash)
 export LIBGL_ALWAYS_SOFTWARE=1
-export GSK_RENDERER=cairo
-export WEBKIT_DISABLE_COMPOSITING_MODE=1
-export WEBKIT_DISABLE_DMABUF_RENDERER=1
 
-# execute the actual binary, passing all arguments ("$@") along
+# Reset other flags that might cause glitches
+unset GSK_RENDERER
+unset WEBKIT_DISABLE_COMPOSITING_MODE
+unset WEBKIT_DISABLE_DMABUF_RENDERER
+
+# Launch
 exec /usr/bin/foliate "$@" 2> /dev/null
