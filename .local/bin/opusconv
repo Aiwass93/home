@@ -1,28 +1,30 @@
 #!/usr/bin/env python3
 
-# the script to bulk convert audio files to opus, it's a format which can have decent quality while been super small, i convert my songs on computer to flac to listen them on my phone.
-
 import os
 import subprocess
 import sys
 import base64
+import re
+import tempfile
+import shutil
 from pathlib import Path
+import glob
 
-# Try import mutagen for artwork handling
+# Try to import mutagen for artwork handling
 try:
     import mutagen
     from mutagen import File
     from mutagen.flac import Picture
+    from mutagen.oggopus import OggOpus
 except ImportError:
     print("WARNING: 'mutagen' library not found. Artwork will NOT be copied.")
     print("Run: pip install mutagen")
     mutagen = None
 
-###### config
-SOURCE_DIR = r"/this is the path to the folder which contains all music you wanna convert"
-DEST_DIR   = r"/this is the path to the destination of the converted opus files."
+# --- CONFIGURATION ---
+DEST_DIR = r"/home/alice/opus/"
 
-EXT_LOSSLESS = {'.flac', '.wav', '.aiff', '.ape', '.alac'}
+EXT_LOSSLESS = {'.flac', '.wav', '.aiff', '.ape', '.alac', '.tak'}
 EXT_LOSSY    = {'.mp3', '.m4a', '.aac', '.ogg', '.wma'}
 
 def get_bitrate(extension):
@@ -33,29 +35,160 @@ def get_bitrate(extension):
         return "192k"
     return None
 
-def copy_artwork(source_path, dest_path):
+def get_seconds(timestamp):
+    """Converts MM:SS:FF (frames) to seconds."""
+    parts = timestamp.split(':')
+    minutes = int(parts[0])
+    seconds = int(parts[1])
+    frames = int(parts[2])
+    return (minutes * 60) + seconds + (frames / 75.0)
+
+def sanitize_filename(name):
+    """Removes illegal characters from filenames."""
+    return re.sub(r'[<>:"/\\|?*]', '_', str(name)).strip()
+
+def parse_cue(cue_path):
     """
-    Reads artwork from source and embeds it into the Opus file
-    using standard VorbisComment METADATA_BLOCK_PICTURE.
+    Parses CUE sheet for tracks and global metadata.
+    Returns (tracks, referenced_files_set, is_single_file).
+    is_single_file is True if all tracks reference the same audio file.
     """
+    encodings = ['utf-8', 'latin-1', 'cp1252', 'shift_jis', 'gbk', 'big5']
+    content = []
+
+    for enc in encodings:
+        try:
+            with open(cue_path, 'r', encoding=enc) as f:
+                content = f.readlines()
+            break
+        except UnicodeDecodeError:
+            continue
+
+    if not content:
+        return [], set(), False
+
+    tracks = []
+    current_track = {}
+    album_meta = {
+        'artist': 'Unknown Artist',
+        'title': 'Unknown Album',
+        'date': None,
+        'genre': None,
+        'disc': None
+    }
+    current_file = None
+    referenced_files = set()
+
+    for line in content:
+        line = line.strip()
+
+        if line.startswith('REM DATE'):
+            album_meta['date'] = line.split(' ', 2)[2] if len(line.split(' ', 2)) > 2 else None
+        elif line.startswith('REM GENRE'):
+            album_meta['genre'] = line.split(' ', 2)[2] if len(line.split(' ', 2)) > 2 else None
+        elif line.startswith('REM DISCID') or line.startswith('REM DISC'):
+            match = re.search(r'\d+', line)
+            if match:
+                album_meta['disc'] = match.group(0)
+
+        if line.startswith('FILE'):
+            match = re.search(r'FILE "(.*)"', line)
+            if match:
+                current_file = match.group(1)
+                referenced_files.add(current_file)
+
+        if not tracks and not current_track.get('number'):
+            if line.startswith('PERFORMER'):
+                match = re.search(r'PERFORMER "(.*)"', line)
+                if match:
+                    album_meta['artist'] = match.group(1)
+            if line.startswith('TITLE'):
+                match = re.search(r'TITLE "(.*)"', line)
+                if match:
+                    album_meta['title'] = match.group(1)
+
+        if line.startswith('TRACK'):
+            if current_track:
+                tracks.append(current_track)
+            num_match = re.search(r'TRACK (\d+)', line)
+            track_num = num_match.group(1) if num_match else "00"
+            current_track = {
+                'file': current_file,
+                'number': track_num,
+                'artist': album_meta['artist'],
+                'album': album_meta['title'],
+                'date': album_meta['date'],
+                'genre': album_meta['genre'],
+                'disc': album_meta['disc']
+            }
+
+        if line.startswith('TITLE') and current_track:
+            match = re.search(r'TITLE "(.*)"', line)
+            if match:
+                current_track['title'] = match.group(1)
+
+        if line.startswith('PERFORMER') and current_track:
+            match = re.search(r'PERFORMER "(.*)"', line)
+            if match:
+                current_track['artist'] = match.group(1)
+
+        if line.startswith('INDEX 01') and current_track:
+            match = re.search(r'INDEX 01 (\d{2}:\d{2}:\d{2})', line)
+            if match:
+                current_track['start_time'] = get_seconds(match.group(1))
+
+    if current_track:
+        tracks.append(current_track)
+
+    # Determine if this is a single-file CUE (for splitting) or multi-file CUE (just metadata)
+    is_single_file = len(referenced_files) == 1
+
+    return tracks, referenced_files, is_single_file
+
+def find_cue_for_audio(audio_path):
+    """
+    Find a CUE file that references this audio file.
+    Only returns a match if it's a single-file CUE (meant for splitting).
+    """
+    audio_path = Path(audio_path)
+    audio_dir = audio_path.parent
+    audio_stem = audio_path.stem.lower()
+    audio_name = audio_path.name.lower()
+
+    for cue_file in audio_dir.glob("*.cue"):
+        tracks, referenced_files, is_single_file = parse_cue(cue_file)
+        if not tracks or not referenced_files:
+            continue
+
+        # Only use CUE for splitting if it references a single file
+        if not is_single_file:
+            continue
+
+        for ref_file in referenced_files:
+            ref_stem = Path(ref_file).stem.lower()
+            ref_name = Path(ref_file).name.lower()
+            if ref_name == audio_name or ref_stem == audio_stem:
+                return cue_file, tracks
+
+    return None, None
+
+def extract_artwork(source_path):
+    """Extract artwork from source file, returns list of Picture objects."""
     if not mutagen:
-        return
+        return []
 
     try:
         source_file = File(source_path)
-        dest_file = File(dest_path)
+        if not source_file:
+            return []
 
         pics = []
 
-        # extract from flac/vorbis
-        if hasattr(source_file, 'pictures'):
-            pics = source_file.pictures
-
-        # extract from id3(mp3)
-        elif hasattr(source_file, 'tags'):
+        if hasattr(source_file, 'pictures') and source_file.pictures:
+            pics = list(source_file.pictures)
+        elif hasattr(source_file, 'tags') and source_file.tags:
             for key in source_file.tags.keys():
                 if key.startswith('APIC:'):
-                    # Convert APIC frame to Flac Picture format
                     apic = source_file.tags[key]
                     p = Picture()
                     p.data = apic.data
@@ -63,69 +196,213 @@ def copy_artwork(source_path, dest_path):
                     p.mime = apic.mime
                     p.desc = apic.desc
                     pics.append(p)
+        return pics
+    except Exception:
+        return []
 
-        if not pics:
+def embed_artwork(dest_path, pics):
+    """Embed artwork into Opus file."""
+    if not mutagen or not pics:
+        return
+
+    try:
+        dest_file = File(dest_path)
+        if dest_file is None:
             return
-
-        # embed into opus
-        # opus requires the picture block to be base64 encoded inside a comment
         dest_file['metadata_block_picture'] = [
             base64.b64encode(p.write()).decode('ascii') for p in pics
         ]
         dest_file.save()
-
     except Exception as e:
-        print(f"    [Warning] cannot copy art: {e}")
+        print(f"    [Warning] Could not embed art: {e}")
 
-def convert_library():
-    if not os.path.exists(SOURCE_DIR):
-        print(f"Error: source directory not found: {SOURCE_DIR}")
-        return
+def convert_single_file(source_path, dest_path, target_bitrate, extra_metadata=None):
+    """
+    Convert a single file or segment to Opus with full metadata.
+    extra_metadata: dict with optional keys like 'ss' (start), 't' (duration),
+                    'title', 'artist', 'album', 'track', 'date', 'genre', 'disc'
+    """
+    extra_metadata = extra_metadata or {}
 
-    print(f"Scanning: {SOURCE_DIR}")
+    cmd = [
+        'ffmpeg',
+        '-y',
+        '-nostdin',
+        '-loglevel', 'error',
+        '-err_detect', 'ignore_err',
+    ]
+
+    if 'ss' in extra_metadata:
+        cmd.extend(['-ss', f"{extra_metadata['ss']:.6f}"])
+
+    cmd.extend(['-i', str(source_path)])
+
+    if 't' in extra_metadata:
+        cmd.extend(['-t', f"{extra_metadata['t']:.6f}"])
+
+    cmd.extend([
+        '-map', '0:a',
+        '-vn',
+        '-c:a', 'libopus',
+        '-b:a', target_bitrate,
+        '-vbr', 'on',
+    ])
+
+    # Copy all metadata from source first
+    cmd.extend(['-map_metadata', '0'])
+
+    # Override with CUE metadata if provided
+    if 'title' in extra_metadata:
+        cmd.extend(['-metadata', f"title={extra_metadata['title']}"])
+    if 'artist' in extra_metadata:
+        cmd.extend(['-metadata', f"artist={extra_metadata['artist']}"])
+    if 'album' in extra_metadata:
+        cmd.extend(['-metadata', f"album={extra_metadata['album']}"])
+    if 'track' in extra_metadata:
+        cmd.extend(['-metadata', f"track={extra_metadata['track']}"])
+    if 'date' in extra_metadata:
+        cmd.extend(['-metadata', f"date={extra_metadata['date']}"])
+    if 'genre' in extra_metadata:
+        cmd.extend(['-metadata', f"genre={extra_metadata['genre']}"])
+    if 'disc' in extra_metadata:
+        cmd.extend(['-metadata', f"disc={extra_metadata['disc']}"])
+
+    cmd.append(str(dest_path))
+
+    subprocess.run(cmd, check=True)
+
+def convert_with_cue(source_path, dest_dir, target_bitrate, tracks, relative_base):
+    """Convert a single audio file with CUE into multiple Opus tracks."""
+    source_path = Path(source_path)
+    dest_dir = Path(dest_dir)
+
+    # Extract artwork once from source
+    pics = extract_artwork(source_path)
+
+    total_tracks = len(tracks)
+
+    for i, track in enumerate(tracks):
+        track_num = track.get('number', f"{i+1:02d}")
+        title = track.get('title', f"Track {track_num}")
+        safe_title = sanitize_filename(title)
+
+        out_name = f"{track_num} - {safe_title}.opus"
+        out_path = dest_dir / out_name
+
+        if out_path.exists():
+            continue
+
+        start_time = track.get('start_time', 0)
+        duration = None
+        if i < total_tracks - 1:
+            if tracks[i + 1].get('file') == track.get('file'):
+                duration = tracks[i + 1]['start_time'] - start_time
+
+        meta = {
+            'ss': start_time,
+            'title': title,
+            'artist': track.get('artist', ''),
+            'album': track.get('album', ''),
+            'track': f"{track_num}/{total_tracks}",
+        }
+        if duration:
+            meta['t'] = duration
+        if track.get('date'):
+            meta['date'] = track['date']
+        if track.get('genre'):
+            meta['genre'] = track['genre']
+        if track.get('disc'):
+            meta['disc'] = track['disc']
+
+        print(f"  [{track_num}/{total_tracks}] {title}")
+
+        try:
+            convert_single_file(source_path, out_path, target_bitrate, meta)
+            embed_artwork(out_path, pics)
+        except subprocess.CalledProcessError:
+            print(f"    !! ERROR converting track {track_num}")
+
+def convert_directory(source_dir):
+    """Convert all audio files in a single source directory."""
+    source_dir = Path(source_dir).resolve()
+
+    if not source_dir.exists():
+        print(f"Error: Source directory not found: {source_dir}")
+        return False
+
+    if not source_dir.is_dir():
+        print(f"Error: Not a directory: {source_dir}")
+        return False
+
+    print(f"Scanning: {source_dir}")
     print(f"Target:   {DEST_DIR}")
     print("-" * 40)
 
-    for root, dirs, files in os.walk(SOURCE_DIR):
+    # Track which audio files are referenced by single-file CUE sheets (for splitting)
+    cue_referenced = set()
+
+    # First pass: identify all CUE-referenced files, but only from single-file CUEs
+    for root, dirs, files in os.walk(source_dir):
+        for filename in files:
+            if filename.lower().endswith('.cue'):
+                cue_path = Path(root) / filename
+                tracks, referenced_files, is_single_file = parse_cue(cue_path)
+
+                # Only consider single-file CUEs for splitting
+                if not is_single_file or not tracks:
+                    if referenced_files and len(referenced_files) > 1:
+                        print(f"[SKIP CUE] Multi-file CUE (not for splitting): {filename}")
+                    continue
+
+                for ref_file in referenced_files:
+                    # Try to find the actual audio file
+                    ref_path = Path(root) / ref_file
+                    if ref_path.exists():
+                        cue_referenced.add(str(ref_path.resolve()))
+                    else:
+                        # Try matching by stem with different extensions
+                        ref_stem = Path(ref_file).stem
+                        for audio_ext in ['.flac', '.ape', '.wav', '.tak', '.mp3', '.m4a']:
+                            candidate = Path(root) / f"{ref_stem}{audio_ext}"
+                            if candidate.exists():
+                                cue_referenced.add(str(candidate.resolve()))
+                                break
+
+    # Second pass: convert files
+    for root, dirs, files in os.walk(source_dir):
         for filename in files:
             source_path = Path(root) / filename
             target_bitrate = get_bitrate(source_path.suffix)
             if not target_bitrate:
                 continue
 
-            relative_path = source_path.relative_to(SOURCE_DIR)
-            dest_path = Path(DEST_DIR) / relative_path.with_suffix('.opus')
+            relative_path = source_path.relative_to(source_dir.parent)
 
+            # Check if this file has an associated single-file CUE sheet
+            if str(source_path.resolve()) in cue_referenced:
+                cue_file, tracks = find_cue_for_audio(source_path)
+                if cue_file and tracks:
+                    # Create destination directory (same structure)
+                    dest_subdir = Path(DEST_DIR) / relative_path.parent
+                    os.makedirs(dest_subdir, exist_ok=True)
+
+                    print(f"[CUE SPLIT] ({target_bitrate}): {relative_path}")
+                    convert_with_cue(source_path, dest_subdir, target_bitrate, tracks, relative_path)
+                    continue
+
+            # Normal single-file conversion
+            dest_path = Path(DEST_DIR) / relative_path.with_suffix('.opus')
             os.makedirs(dest_path.parent, exist_ok=True)
 
             if dest_path.exists():
-                # print(f"[SKIP] Exists: {relative_path}")
                 continue
 
             print(f"[CONVERTING] ({target_bitrate}): {relative_path}")
 
-            # ffmpeg commands
-            cmd = [
-                'ffmpeg',
-                '-n',                  # do not overwrite
-                '-nostdin',            # no terminal interaction
-                '-loglevel', 'error',  # quiet output
-                '-err_detect', 'ignore_err', # ignore corrupted headers
-                '-i', str(source_path),
-                '-map', '0:a',         # select only audio
-                '-vn',                 # explicitly disable video streams
-                '-map_metadata', '0',  # copy text tags (Artist, Title, etc)
-                '-c:a', 'libopus',
-                '-b:a', target_bitrate,
-                '-vbr', 'on',
-                str(dest_path)
-            ]
-
             try:
-                subprocess.run(cmd, check=True)
-                # copy the artwork manually
-                copy_artwork(source_path, dest_path)
-
+                convert_single_file(source_path, dest_path, target_bitrate)
+                pics = extract_artwork(source_path)
+                embed_artwork(dest_path, pics)
             except subprocess.CalledProcessError:
                 print(f"!! ERROR converting: {filename}")
             except KeyboardInterrupt:
@@ -133,7 +410,40 @@ def convert_library():
                 sys.exit()
 
     print("-" * 40)
-    print("Done!")
+    return True
+
+def main():
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} <source_dir> [source_dir2] ...")
+        print(f"       {sys.argv[0]} /path/to/album*")
+        print(f"\nDestination directory: {DEST_DIR}")
+        sys.exit(1)
+
+    source_dirs = []
+    for arg in sys.argv[1:]:
+        expanded = glob.glob(arg)
+        if expanded:
+            source_dirs.extend(expanded)
+        else:
+            source_dirs.append(arg)
+
+    seen = set()
+    unique_dirs = []
+    for d in source_dirs:
+        resolved = str(Path(d).resolve())
+        if resolved not in seen:
+            seen.add(resolved)
+            unique_dirs.append(d)
+
+    print(f"Processing {len(unique_dirs)} director{'y' if len(unique_dirs) == 1 else 'ies'}...")
+    print("=" * 40)
+
+    for source_dir in unique_dirs:
+        convert_directory(source_dir)
+        print()
+
+    print("=" * 40)
+    print("All done.")
 
 if __name__ == "__main__":
-    convert_library()
+    main()
