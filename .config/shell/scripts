@@ -96,65 +96,188 @@ man() {
 
 ######################
 # FZF TOOL
-# make fuzzy find program actually work, able to preview images and text files, auto skip huge files for safety, auto skip binary files to avoid meaningless content
+# Fuzzy finder with rich previews — crisp images via ueberzugpp (fallback: chafa),
+# video thumbnails, syntax-highlighted text.
+# Auto-skips large (>10 MB) and binary files for safety.
+#
+# Dependencies:
+#   required : fzf, fd, bat, ripgrep
+#   images   : ueberzugpp (crisp) or chafa (text-based fallback)
+#   video    : ffmpegthumbnailer
+#
+# Commands:
+#   ff [query]  — fuzzy file finder
+#   fg [query]  — live ripgrep
+#
+# Keybindings inside fzf:
+#   enter       open file (nvim / nsxiv / mpv / zathura)
+#   ctrl-y      copy absolute path to clipboard and exit
+#   ctrl-o      cd into parent directory and exit
+#   ctrl-p      show absolute path in preview pane
+#   ctrl-/      toggle preview panel
+#   ctrl-d / u  scroll preview down / up
 ######################
 
-# capture path for recursive calls
 SELF=${(%):-%x}
 
-# helper functions
+# ── Helpers ───────────────────────────────────────────────────────
+
+_fzf_to_clipboard() {
+    if command -v wl-copy &>/dev/null; then
+        printf '%s' "$1" | wl-copy
+    elif command -v xclip &>/dev/null; then
+        printf '%s' "$1" | xclip -selection clipboard
+    elif command -v xsel &>/dev/null; then
+        printf '%s' "$1" | xsel --clipboard --input
+    elif command -v pbcopy &>/dev/null; then
+        printf '%s' "$1" | pbcopy
+    else
+        echo "[!] No clipboard utility found (need wl-copy, xclip, xsel, or pbcopy)" >&2
+        return 1
+    fi
+}
+
+_fzf_abspath() {
+    local file="${1%%:*}"
+    realpath -- "$file" 2>/dev/null \
+        || printf '%s/%s' "$(cd "$(dirname -- "$file")" && pwd)" "$(basename -- "$file")"
+}
 
 _fzf_opener() {
     local file="${1%%:*}"
     local line="${1##*:}"
-    if [[ ! -e "$file" ]]; then return; fi
-    case "$file" in
-        *.png|*.jpg|*.jpeg|*.gif|*.webp) setsid -f nsxiv "$file" >/dev/null 2>&1 ;;
-        *.mp4|*.mkv|*.webm)             setsid -f mpv "$file" >/dev/null 2>&1 ;;
-        *.pdf)                          setsid -f zathura "$file" >/dev/null 2>&1 ;;
+    [[ ! -e "$file" ]] && return 1
+
+    case "${file:l}" in
+        *.png|*.jpg|*.jpeg|*.gif|*.webp|*.bmp|*.tiff)
+            setsid -f nsxiv "$file" >/dev/null 2>&1 ;;
+        *.mp4|*.mkv|*.webm|*.avi|*.mov)
+            setsid -f mpv "$file" >/dev/null 2>&1 ;;
+        *.pdf)
+            setsid -f zathura "$file" >/dev/null 2>&1 ;;
         *)
-            if [[ "$line" =~ ^[0-9]+$ ]] && [ "$line" != "$file" ]; then
+            if [[ "$line" =~ ^[0-9]+$ && "$line" != "$file" ]]; then
                 nvim "+$line" "$file"
             else
                 nvim "$file"
-            fi
-            ;;
+            fi ;;
     esac
 }
+
+# ── ueberzugpp ────────────────────────────────────────────────────
+# Same FIFO + layer pattern as lfub:
+#   • parent keeps fd 3 open on the FIFO so the pipe stays alive
+#   • preview sub-processes write JSON commands to the FIFO by path
+#   • fzf itself runs with 3>&- (doesn't need the fd)
+
+_fzf_ub_clear() {
+    [[ -n "$FIFO_UEBERZUG" && -p "$FIFO_UEBERZUG" ]] || return 0
+    printf '{"action":"remove","identifier":"fzf-preview"}\n' \
+        > "$FIFO_UEBERZUG" 2>/dev/null
+}
+
+_fzf_ub_draw() {
+    [[ -n "$FIFO_UEBERZUG" && -p "$FIFO_UEBERZUG" ]] || return 1
+    local file="$1"
+    local abspath
+    abspath=$(realpath -- "$file" 2>/dev/null) || abspath="$PWD/$file"
+
+    # escape backslashes and double-quotes for JSON
+    local jp="${abspath//\\/\\\\}"
+    jp="${jp//\"/\\\"}"
+
+    # preview-pane position — use fzf 0.54+ vars if available, else calculate
+    # for --border=rounded --preview-window='right:62%,border-left'
+    local cols=${COLUMNS:-$(tput cols)}
+    local x y
+    if [[ -n "$FZF_PREVIEW_LEFT" ]]; then
+        x=$FZF_PREVIEW_LEFT  y=${FZF_PREVIEW_TOP:-1}
+    else
+        x=$(( cols - FZF_PREVIEW_COLUMNS - 1 ))
+        y=1
+    fi
+
+    printf '{"action":"add","identifier":"fzf-preview","x":%d,"y":%d,"width":%d,"height":%d,"scaler":"contain","path":"%s"}\n' \
+        "$x" "$y" "$FZF_PREVIEW_COLUMNS" "$FZF_PREVIEW_LINES" "$jp" \
+        > "$FIFO_UEBERZUG" 2>/dev/null
+}
+
+_fzf_ub_start() {
+    [[ -n "$SSH_CLIENT" || -n "$SSH_TTY" ]] && return 1
+    local ub
+    if   command -v ueberzugpp &>/dev/null; then ub=ueberzugpp
+    elif command -v ueberzug   &>/dev/null; then ub=ueberzug
+    else return 1; fi
+
+    [[ ! -d "$HOME/.cache/fzf" ]] && mkdir -p "$HOME/.cache/fzf"
+    export FIFO_UEBERZUG="$HOME/.cache/fzf/ueberzug-$$"
+    rm -f "$FIFO_UEBERZUG" 2>/dev/null        # clean stale fifo
+    mkfifo "$FIFO_UEBERZUG"
+    $ub layer -s < "$FIFO_UEBERZUG" -p json &
+    _FZF_UB_PID=$!
+    exec 3>"$FIFO_UEBERZUG"                   # keep pipe alive
+}
+
+_fzf_ub_stop() {
+    exec 3>&- 2>/dev/null
+    if [[ -n "$_FZF_UB_PID" ]]; then
+        kill "$_FZF_UB_PID" 2>/dev/null
+        wait "$_FZF_UB_PID" 2>/dev/null
+    fi
+    [[ -p "$FIFO_UEBERZUG" ]] && rm -f "$FIFO_UEBERZUG"
+    rm -f "$HOME/.cache/fzf/thumb-$$.jpg" 2>/dev/null
+    unset FIFO_UEBERZUG _FZF_UB_PID
+}
+
+# ── Previewer ─────────────────────────────────────────────────────
 
 _fzf_previewer() {
     local file="${1%%:*}"
     local line="${1##*:}"
+    local fl="${file:l}"
 
-    # check files
-    if [ -d "$file" ]; then
-        ls -A --color=always "$file"
-        return
+    # always clear the previous image overlay first
+    _fzf_ub_clear
+
+    if [[ -d "$file" ]]; then
+        ls -A --color=always "$file"; return
     fi
-    # check file size, skip it if too large (default 10mb)
-    if [ -f "$file" ] && [ "$(wc -c < "$file")" -gt 10000000 ]; then
-        echo -e "\033[31m[!] File too large for preview (>10MB)\033[0m"
-        return
-    fi
-    # check binary files
-    if grep -qI . "$file" 2>/dev/null; then
-        :
-    else
-        if [[ ! "$file" =~ \.(png|jpg|jpeg|gif|webp|mp4|mkv|webm|pdf)$ ]]; then
-             echo -e "\033[33m[!] Binary file detected - Preview skipped\033[0m"
-             return
+    [[ -e "$file" ]] || { printf '\033[31m[!] Not found: %s\033[0m\n' "$file"; return; }
+
+    # size guard (non-media only; media previews are lightweight)
+    if [[ -f "$file" \
+        && ! "$fl" =~ \.(png|jpg|jpeg|gif|webp|bmp|tiff|mp4|mkv|webm|avi|mov)$ ]]; then
+        local sz
+        sz=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null)
+        if (( sz > 10000000 )); then
+            printf '\033[31m[!] File too large for preview (>10 MB)\033[0m\n'; return
         fi
     fi
-    #########################################
 
-    if [[ "$file" =~ \.(png|jpg|jpeg|gif|webp)$ ]]; then
-        chafa -c full --color-space rgb -s "${FZF_PREVIEW_COLUMNS}x${FZF_PREVIEW_LINES}" "$file"
-    elif [[ "$file" =~ \.(mp4|mkv|webm)$ ]]; then
-        local thumb="/tmp/fzf-thumb.jpg"
-        ffmpegthumbnailer -i "$file" -o "$thumb" -s 0 -q 5 >/dev/null 2>&1
-        chafa -c full --color-space rgb -s "${FZF_PREVIEW_COLUMNS}x${FZF_PREVIEW_LINES}" "$thumb"
+    # binary guard (non-media only)
+    if [[ ! "$fl" =~ \.(png|jpg|jpeg|gif|webp|bmp|tiff|mp4|mkv|webm|avi|mov|pdf)$ ]]; then
+        if ! grep -qI . "$file" 2>/dev/null; then
+            printf '\033[33m[!] Binary file – preview skipped\033[0m\n'; return
+        fi
+    fi
+
+    # ── render ──
+    if [[ "$fl" =~ \.(png|jpg|jpeg|gif|webp|bmp|tiff)$ ]]; then
+        _fzf_ub_draw "$file" && return
+        # fallback: chafa (SSH / no ueberzugpp)
+        chafa -c full --color-space rgb \
+            -s "${FZF_PREVIEW_COLUMNS}x${FZF_PREVIEW_LINES}" "$file"
+
+    elif [[ "$fl" =~ \.(mp4|mkv|webm|avi|mov)$ ]]; then
+        local thumb="$HOME/.cache/fzf/thumb-$$.jpg"
+        ffmpegthumbnailer -i "$file" -o "$thumb" -s 0 -q 5 >/dev/null 2>&1 || return
+        if _fzf_ub_draw "$thumb"; then return; fi   # thumb cleaned in _fzf_ub_stop
+        chafa -c full --color-space rgb \
+            -s "${FZF_PREVIEW_COLUMNS}x${FZF_PREVIEW_LINES}" "$thumb"
+        rm -f "$thumb"
+
     else
-        if [[ "$line" =~ ^[0-9]+$ ]] && [ "$line" != "$file" ]; then
+        if [[ "$line" =~ ^[0-9]+$ && "$line" != "$file" ]]; then
             bat --style=numbers --color=always --highlight-line "$line" "$file"
         else
             bat --style=numbers --color=always "$file"
@@ -162,56 +285,126 @@ _fzf_previewer() {
     fi
 }
 
-# diapatcher
-if [[ "$1" == "--preview" ]]; then
-    _fzf_previewer "$2"
-    return 0
-fi
-if [[ "$1" == "--open" ]]; then
-    _fzf_opener "$2"
-    return 0
-fi
+# ── Dispatcher (fzf sub-processes call: zsh <SELF> <action> <arg>) ──
 
-# main commands
+case "$1" in
+    --preview)  _fzf_previewer "$2"; return 0 ;;
+    --open)     _fzf_opener "$2";    return 0 ;;
+    --abspath)
+        _fzf_ub_clear
+        printf '\033[1;36mAbsolute path:\033[0m\n'
+        _fzf_abspath "$2"
+        return 0 ;;
+    --copy-path)
+        local _p; _p=$(_fzf_abspath "$2")
+        _fzf_to_clipboard "$_p"
+        return 0 ;;
+esac
 
-# we use functions with underscores so we can alias them safely
+# ── ff — fuzzy file finder ───────────────────────────────────────
 
 _ff_func() {
-    # takes all arguments as the query (you should quote "multi word strings like this")
     local query="$*"
+    local header='enter: open │ ^y: yank path │ ^o: open dir │ ^p: path │ ^/: preview'
 
-    IFS=$'\n' files=($(fd --type f --hidden --follow --exclude .git | \
-        fzf --query "$query" \
-            --preview "zsh $SELF --preview {}" \
-            --layout=reverse \
-            --border \
-            --height 100% \
-            --preview-window='right:62%,border-left' \
-            --bind 'enter:become(echo {})'
-    ))
-    [[ -n "$files" ]] && _fzf_opener "$files"
+    _fzf_ub_start
+    local result
+    {
+        result=$(fd --type f --hidden --follow --strip-cwd-prefix --exclude .git | \
+            fzf --query "$query" \
+                --scheme=path \
+                --preview "zsh '${SELF}' --preview {}" \
+                --layout=reverse \
+                --border=rounded \
+                --height=100% \
+                --info=inline-right \
+                --header "$header" \
+                --preview-window='right:62%,border-left' \
+                --bind 'ctrl-/:toggle-preview' \
+                --bind 'ctrl-d:preview-half-page-down' \
+                --bind 'ctrl-u:preview-half-page-up' \
+                --bind "ctrl-p:preview(zsh '${SELF}' --abspath {})" \
+                --bind "ctrl-y:become(printf '__COPY__:%s' {})" \
+                --bind "ctrl-o:become(printf '__DIR__:%s' {})" \
+                --bind "enter:become(printf '__OPEN__:%s' {})" \
+                3>&-
+        )
+    } always {
+        _fzf_ub_stop
+    }
+
+    case "$result" in
+        __COPY__:*)
+            local abs; abs=$(_fzf_abspath "${result#__COPY__:}")
+            _fzf_to_clipboard "$abs" \
+                && printf 'Copied: %s\n' "$abs" \
+                || printf '%s\n' "$abs"
+            ;;
+        __DIR__:*)
+            local target="${result#__DIR__:}"
+            local dir
+            [[ -d "$target" ]] && dir="$target" || dir=$(dirname -- "$target")
+            cd -- "$dir" && printf 'cd: %s\n' "$(pwd)"
+            ;;
+        __OPEN__:*)
+            _fzf_opener "${result#__OPEN__:}"
+            ;;
+    esac
 }
+
+# ── fg — live ripgrep ────────────────────────────────────────────
 
 _fg_func() {
-    # take all arguments as the query
     local query="$*"
+    local header='enter: open │ ^y: yank path │ ^o: open dir │ ^p: path │ ^/: preview'
+    local RG_PREFIX="rg --column --line-number --no-heading --color=always --smart-case"
 
-    rm -f /tmp/rg-fzf-{r,f}
-    # we escape quotes to prevent breaking the fzf bind string
-    RG_PREFIX="rg --column --line-number --no-heading --color=always --smart-case "
+    _fzf_ub_start
+    local result
+    {
+        result=$(fzf --ansi --disabled --query "$query" \
+            --bind "start:reload:$RG_PREFIX {q} || true" \
+            --bind "change:reload:sleep 0.05; $RG_PREFIX {q} || true" \
+            --delimiter : \
+            --preview "zsh '${SELF}' --preview {1}:{2}" \
+            --layout=reverse \
+            --border=rounded \
+            --height=100% \
+            --info=inline-right \
+            --header "$header" \
+            --preview-window='right:62%,border-left' \
+            --bind 'ctrl-/:toggle-preview' \
+            --bind 'ctrl-d:preview-half-page-down' \
+            --bind 'ctrl-u:preview-half-page-up' \
+            --bind "ctrl-p:preview(zsh '${SELF}' --abspath {1})" \
+            --bind "ctrl-y:become(printf '__COPY__:%s' {1})" \
+            --bind "ctrl-o:become(printf '__DIR__:%s' {1})" \
+            --bind "enter:become(printf '__OPEN__:%s:%s' {1} {2})" \
+            3>&-
+        )
+    } always {
+        _fzf_ub_stop
+    }
 
-    fzf --ansi --disabled --query "$query" \
-        --bind "start:reload:$RG_PREFIX {q}" \
-        --bind "change:reload:$RG_PREFIX {q}" \
-        --delimiter : \
-        --preview "zsh $SELF --preview {1}:{2}" \
-        --layout=reverse \
-        --border \
-        --height 100% \
-        --preview-window 'right:62%,border-left' \
-        --bind "enter:execute(zsh $SELF --open {1}:{2})+abort"
+    case "$result" in
+        __COPY__:*)
+            local abs; abs=$(_fzf_abspath "${result#__COPY__:}")
+            _fzf_to_clipboard "$abs" \
+                && printf 'Copied: %s\n' "$abs" \
+                || printf '%s\n' "$abs"
+            ;;
+        __DIR__:*)
+            local target="${result#__DIR__:}"
+            local dir
+            [[ -d "$target" ]] && dir="$target" || dir=$(dirname -- "$target")
+            cd -- "$dir" && printf 'cd: %s\n' "$(pwd)"
+            ;;
+        __OPEN__:*)
+            _fzf_opener "${result#__OPEN__:}"
+            ;;
+    esac
 }
 
-# aliases
+# ── Aliases ──────────────────────────────────────────────────────
 alias ff='noglob _ff_func'
-alias fg='noglob _fg_func'
+alias fg='noglob _fg_func'   # ⚠ shadows built-in `fg`; rename if you use job control
